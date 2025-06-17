@@ -1,0 +1,193 @@
+# Import libraries
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+import shap
+import joblib
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder, RobustScaler
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import classification_report, confusion_matrix, precision_recall_curve, roc_auc_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.ensemble import GradientBoostingClassifier
+
+# Load dataset
+data = pd.read_csv(r"D:\\Downloads\\WA_Fn-UseC_-Telco-Customer-Churn.csv")
+
+# Save customerID separately
+customer_ids = data['customerID']
+
+# Convert TotalCharges to numeric
+data['TotalCharges'] = pd.to_numeric(data['TotalCharges'], errors='coerce')
+
+# Fill missing TotalCharges
+data['TotalCharges'].fillna(data['TotalCharges'].median(), inplace=True)
+
+# Encode target variable
+data['Churn'] = data['Churn'].map({'Yes': 1, 'No': 0})
+
+# Add customerID back to feature set for tracking
+X = data.drop('Churn', axis=1)
+y = data['Churn']
+
+# Split customer ID from features
+X['customerID'] = customer_ids
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Store test customer IDs
+customer_id_test = X_test['customerID']
+
+# Drop ID before training
+X_train = X_train.drop(columns=['customerID'])
+X_test = X_test.drop(columns=['customerID'])
+
+# Feature groups
+numeric_features = ['tenure', 'MonthlyCharges', 'TotalCharges']
+categorical_features = X_train.select_dtypes(include=['object']).columns.tolist()
+
+# Pipelines
+numeric_transformer = Pipeline([
+    ('imputer', SimpleImputer(strategy='median')),
+    ('scaler', RobustScaler())
+])
+
+categorical_transformer = Pipeline([
+    ('encoder', OneHotEncoder(handle_unknown='ignore'))
+])
+
+preprocessor = ColumnTransformer([
+    ('num', numeric_transformer, numeric_features),
+    ('cat', categorical_transformer, categorical_features)
+])
+
+# Model dictionary
+models = {
+    'Logistic Regression': LogisticRegression(max_iter=1000, random_state=42),
+    'Support Vector Machine': SVC(probability=True, random_state=42),
+    'Gradient Boosting': GradientBoostingClassifier(random_state=42)
+}
+
+best_model = None
+best_score = 0
+
+for name, clf in models.items():
+    print(f"\n=== Training {name} ===")
+    model_pipeline = Pipeline([
+        ('preprocessor', preprocessor),
+        ('classifier', clf)
+    ])
+    model_pipeline.fit(X_train, y_train)
+    y_pred = model_pipeline.predict(X_test)
+    print(confusion_matrix(y_test, y_pred))
+    print(classification_report(y_test, y_pred))
+    score = roc_auc_score(y_test, model_pipeline.predict_proba(X_test)[:, 1])
+    print(f"ROC AUC: {score:.4f}")
+    if score > best_score:
+        best_score = score
+        best_model = model_pipeline
+        best_model_name = name
+
+print(f"\nBest model selected: {best_model_name} with ROC AUC: {best_score:.4f}")
+
+# -------- SHAP Analysis --------
+import shap
+
+print(f"\nRunning SHAP analysis for {best_model_name}...")
+
+# Transform test set with preprocessing pipeline
+X_test_transformed = best_model.named_steps['preprocessor'].transform(X_test)
+
+# Get feature names after preprocessing (numeric + one-hot encoded categorical)
+feature_names = best_model.named_steps['preprocessor'].get_feature_names_out()
+
+# Select appropriate SHAP explainer depending on model
+if best_model_name == 'Logistic Regression':
+    explainer = shap.LinearExplainer(best_model.named_steps['classifier'], X_test_transformed, feature_perturbation="interventional")
+elif best_model_name == 'Gradient Boosting':
+    explainer = shap.TreeExplainer(best_model.named_steps['classifier'])
+else:
+    # For SVM or other models, KernelExplainer can be used but slower
+    explainer = shap.KernelExplainer(best_model.named_steps['classifier'].predict_proba, X_test_transformed[:100])
+
+shap_values = explainer.shap_values(X_test_transformed)
+
+# For binary classification, shap_values is a list for each class, take class 1
+if isinstance(shap_values, list):
+    shap_vals = shap_values[1]
+else:
+    shap_vals = shap_values
+
+# Plot SHAP summary plot
+import matplotlib.pyplot as plt
+
+shap.summary_plot(shap_vals, features=X_test_transformed, feature_names=feature_names, show=False)
+plt.savefig('shap_summary_plot.png')  # Saves the plot as PNG file in your current working directory
+plt.close()  # Close the plot to free memory
+
+
+
+# SHAP analysis for Gradient Boosting only
+if best_model_name == 'Gradient Boosting':
+    print("\nRunning SHAP analysis...")
+    X_train_transformed = best_model.named_steps['preprocessor'].transform(X_train)
+    X_test_transformed = best_model.named_steps['preprocessor'].transform(X_test)
+    feature_names = best_model.named_steps['preprocessor'].get_feature_names_out()
+    explainer = shap.Explainer(best_model.named_steps['classifier'], X_train_transformed)
+    shap_values = explainer(X_test_transformed)
+    shap.summary_plot(shap_values, feature_names=feature_names)
+
+# Save model
+joblib.dump(best_model, 'telco_churn_best_model.pkl')
+print("Model saved as 'telco_churn_best_model.pkl'")
+
+# Refit Logistic Regression with class weight balancing
+lr_balanced = LogisticRegression(class_weight='balanced', max_iter=1000, random_state=42)
+pipeline_balanced = Pipeline([
+    ('preprocessor', preprocessor),
+    ('classifier', lr_balanced)
+])
+pipeline_balanced.fit(X_train, y_train)
+y_pred_bal = pipeline_balanced.predict(X_test)
+print("=== Balanced LR Confusion Matrix ===")
+print(confusion_matrix(y_test, y_pred_bal))
+print("\n=== Balanced LR Classification Report ===")
+print(classification_report(y_test, y_pred_bal, target_names=['Stay','Churn']))
+
+# Precision-recall curve
+probs = pipeline_balanced.predict_proba(X_test)[:, 1]
+precision, recall, thresholds = precision_recall_curve(y_test, probs)
+plt.plot(thresholds, precision[:-1], label='Precision')
+plt.plot(thresholds, recall[:-1], label='Recall')
+plt.xlabel('Probability threshold')
+plt.ylabel('Score')
+plt.title('Precision & Recall vs. Threshold')
+plt.legend()
+plt.show()
+
+# Threshold-based prediction
+threshold = 0.45
+y_pred_thresh = (probs >= threshold).astype(int)
+print(f"=== Confusion Matrix @ thresh={threshold} ===")
+print(confusion_matrix(y_test, y_pred_thresh))
+print(f"\n=== Classification Report @ thresh={threshold} ===")
+print(classification_report(y_test, y_pred_thresh, target_names=['Stay','Churn']))
+
+# Create customer-specific output
+churn_results = pd.DataFrame({
+    'customerID': customer_id_test.values,
+    'Churn_Probability': probs,
+    'Predicted_Churn': y_pred_thresh
+})
+
+churn_results_sorted = churn_results.sort_values(by='Churn_Probability', ascending=False)
+print("\nTop 10 Customers Likely to Churn:")
+print(churn_results_sorted.head(10))
+
+# Save to CSV
+churn_results_sorted.to_csv("likely_churn_customers.csv", index=False)
+print("Predictions saved to 'likely_churn_customers.csv'")
